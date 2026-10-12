@@ -87,9 +87,9 @@ pc = PCA(2).fit_transform(Xs); ax[2].scatter(pc[:, 0], pc[:, 1], c=lab, s=4, cma
 plt.tight_layout(); plt.savefig("results/fig_cluster.png", bbox_inches="tight"); plt.show()
 '''
 C["features"] = '''\
-# ---- Rekayasa fitur untuk peramalan DAY-AHEAD ----
-# Skema: ramalan diterbitkan pukul 00:00 hari D untuk 24 jam hari D. Hanya data sampai 23:00 hari D-1 yang boleh dipakai.
-# Setiap fitur berbasis beban memakai lag >= 24 jam, atau nilai yang "dibekukan" pada waktu terbit (23:00 D-1).
+# ---- Pembentukan feature dan target untuk prediksi day-ahead ----
+# Skema: prediksi dibuat pukul 00:00 hari D untuk 24 jam hari D (day-ahead). Hanya data sampai 23:00 hari D-1 yang boleh dipakai.
+# Setiap feature berbasis beban memakai lag >= 24 jam, atau nilai snapshot pada pukul 23:00 D-1.
 def build_features(y):
     d = pd.DataFrame({"y": y}); ix = d.index
     d["hour"] = ix.hour; d["dow"] = ix.dayofweek; d["month"] = ix.month
@@ -100,7 +100,7 @@ def build_features(y):
     for L in (24, 48, 72, 168, 336): d[f"lag{L}"] = d.y.shift(L)
     d["wk_mean"] = pd.concat([d.y.shift(24 * k) for k in range(1, 8)], axis=1).mean(axis=1)    # rata-rata jam yang sama 7 hari terakhir
     d["dmean_prev"] = d.y.shift(24).rolling(24).mean()
-    # fitur "saat terbit": nilai pada 23:00 D-1 (indeks t-(hour+1)) dan statistik 24 jam / 7 hari yang berakhir di titik itu
+    # feature snapshot D-1: nilai pada 23:00 D-1 (indeks t-(hour+1)) dan statistik 24 jam / 7 hari yang berakhir di titik itu
     yv = d.y.values; n = len(d); pos = np.arange(n) - (d.hour.values + 1); ok = pos >= 0; p = np.clip(pos, 0, None)
     r24 = d.y.rolling(24).mean().values; r24max = d.y.rolling(24).max().values; r24min = d.y.rolling(24).min().values; r168 = d.y.rolling(168).mean().values
     for nm, off in (("last_obs", 0), ("last_obs_m3", 3), ("last_obs_m6", 6)):
@@ -114,7 +114,10 @@ CAL = ["hour", "dow", "month", "is_hol", "hol_prev", "hol_next"]
 LAG = ["lag24", "lag48", "lag168", "lag336", "dmean_prev", "wk_mean"]
 ISSUE = ["last_obs", "last_obs_m3", "last_obs_m6", "d1_mean", "d1_max", "d1_min", "w1_mean", "d1_trend", "lag72"]
 SETS = {"A. Kalender saja": CAL, "B. Kalender + lag >=24 jam": CAL + LAG, "C. B + fitur saat-terbit (D-1)": CAL + LAG + ISSUE}
-# ---- Split kronologis ----
+print("jumlah feature pada set final:", len(SETS["C. B + fitur saat-terbit (D-1)"]), "| baris data setelah feature dibentuk:", len(d))
+'''
+C["split"] = '''\
+# ---- Split kronologis (tanpa shuffling) ----
 SPLIT = "2015-01-01"
 tr, te = d[d.index < SPLIT], d[d.index >= SPLIT]
 print(f"train: {tr.index.min().date()} -> {tr.index.max().date()} ({len(tr):,} jam)")
@@ -126,8 +129,8 @@ def metrics(t, p):
     return dict(MAE=float(mae), RMSE=float(rm), R2=float(r2_score(t, p)), rel=float(100 * mae / np.mean(t)))
 '''
 C["leak"] = '''\
-# ---- Uji kebocoran (perturbasi): rusak SELURUH nilai beban hari D dengan angka acak, hitung ulang semua fitur,
-# lalu cek apakah fitur pada jam-jam hari D berubah. Jika ya, fitur itu memakai informasi dari hari yang diramal (bocor).
+# ---- Uji data leakage (perturbation test): ganti SELURUH nilai beban hari D dengan angka acak, hitung ulang semua feature,
+# lalu cek apakah feature pada jam-jam hari D berubah. Jika ya, feature itu memakai informasi dari hari yang sedang diprediksi (leakage).
 FINAL = SETS["C. B + fitur saat-terbit (D-1)"]
 rng_l = np.random.RandomState(0)
 uniq_days = pd.to_datetime(d.index.date).unique()[400:-5]
@@ -140,7 +143,7 @@ for day in test_days:
     rows_ = d.index[(d.index >= day) & (d.index < day + pd.Timedelta(days=1))]
     diff = (d.loc[rows_, FINAL] - d_pert.loc[rows_, FINAL]).abs().max()
     for c_ in diff[diff > 1e-9].index: changed[c_] = changed.get(c_, 0) + 1
-print("fitur yang berubah saat nilai hari D dirusak:", changed if changed else "TIDAK ADA -> tidak ada kebocoran dari hari yang diramal (25 hari acak diuji)")
+print("feature yang berubah saat nilai hari D diganti angka acak:", changed if changed else "TIDAK ADA -> tidak ada data leakage dari hari yang diprediksi (25 hari acak diuji)")
 RES["leak_test"] = dict(n_days=25, n_features=len(FINAL), changed_features=changed)
 '''
 C["baseline"] = '''\
@@ -155,16 +158,16 @@ print(pd.DataFrame(RES["baseline"]).T.round(3).to_string())
 BEST_BASE = min(RES["baseline"], key=lambda k: RES["baseline"][k]["MAE"]); print("\\nbaseline terbaik:", BEST_BASE)
 '''
 C["tune"] = '''\
-# ---- Penalaan HistGradientBoosting: GridSearch + TimeSeriesSplit(4) HANYA pada data train ----
+# ---- Hyperparameter tuning HistGradientBoosting (HGB): GridSearchCV + TimeSeriesSplit(4) HANYA pada data train ----
 GRID = {"learning_rate": [0.03, 0.06], "max_iter": [400, 800], "max_leaf_nodes": [31, 63], "min_samples_leaf": [50, 100]}
 FINAL = SETS["C. B + fitur saat-terbit (D-1)"]
 t0 = time.time()
 gs = GridSearchCV(HistGradientBoostingRegressor(random_state=SEED), GRID, cv=TimeSeriesSplit(4), scoring="neg_mean_absolute_error", n_jobs=-1).fit(tr[FINAL], tr.y)
-print("parameter terbaik:", gs.best_params_, "| MAE CV (train):", round(-gs.best_score_, 1), f"| {time.time()-t0:.0f}s")
+print("parameter terbaik:", gs.best_params_, "| MAE cross-validation (train):", round(-gs.best_score_, 1), f"| {time.time()-t0:.0f}s")
 BP = gs.best_params_; RES["tuning"] = dict(best=BP, cv_mae=float(-gs.best_score_), grid_size=int(np.prod([len(v) for v in GRID.values()])))
 '''
 C["ablation"] = '''\
-# ---- Ablasi fitur: set mana yang layak? Dinilai dengan CV KRONOLOGIS DI DALAM TRAIN (independen dari test) lalu dilaporkan juga di test ----
+# ---- Ablation study: set feature mana yang layak? Dinilai dengan cross-validation kronologis DI DALAM TRAIN (independen dari test), lalu dilaporkan juga di test ----
 abl = []
 for nm, cols in SETS.items():
     cvm = []
@@ -176,7 +179,7 @@ for nm, cols in SETS.items():
 abl = pd.DataFrame(abl); print(abl.round(3).to_string(index=False)); RES["ablation"] = abl.to_dict("records")
 '''
 C["models"] = '''\
-# ---- Perbandingan model pada fitur final (set C) ----
+# ---- Perbandingan model dan baseline pada feature final (set C) ----
 Xtr, Xte = tr[FINAL], te[FINAL]
 models = {}
 hgb = HistGradientBoostingRegressor(random_state=SEED, **BP).fit(Xtr, tr.y); models["HistGradientBoosting (tuned)"] = hgb.predict(Xte)
@@ -193,7 +196,7 @@ print("\\nPenurunan MAE vs baseline terbaik (%s): %.1f%% | RMSE: %.1f%%" % (BEST
 pred = models["HistGradientBoosting (tuned)"]
 '''
 C["rolling"] = '''\
-# ---- Uji ketahanan: rolling-origin 8 lipatan (train meluas, uji = 6 bulan berikutnya), semua data ----
+# ---- Evaluasi rolling-origin: 8 fold (train meluas, testing = 6 bulan berikutnya), semua data ----
 rows = []
 for i, (a, b) in enumerate(TimeSeriesSplit(8, test_size=4380).split(d)):
     A_, B_ = d.iloc[a], d.iloc[b]
@@ -206,7 +209,7 @@ RES["rolling"] = dict(rel_hgb_mean=float(ro.rel_HGB.mean()), rel_hgb_std=float(r
                       hgb_wins=int((ro.rel_HGB < ro.rel_lag24).sum()), n=int(len(ro)), rows=ro.round(3).to_dict("records"))
 '''
 C["errors"] = '''\
-# ---- Analisis galat (set test) ----
+# ---- Analisis error (data testing) ----
 E = te[["y"]].copy(); E["pred"] = pred; E["err"] = E.pred - E.y; E["ae"] = E.err.abs(); E["pe"] = 100 * E.ae / E.y
 E["hour"] = te.hour; E["dow"] = te.dow; E["month"] = te.month; E["is_hol"] = te.is_hol; E["date"] = te.index.date
 by_hour = E.groupby("hour").pe.mean(); by_dow = E.groupby("dow").pe.mean(); by_month = E.groupby("month").pe.mean()
@@ -215,7 +218,7 @@ daily_err = E.groupby("date").agg(mape=("pe", "mean"), mean_y=("y", "mean")); wo
 print("MAPE per tipe hari:", daytype.round(2).to_dict()); print("MAPE per bulan:", by_month.round(2).to_dict())
 print("10 hari terburuk:\\n", worst.round(2).to_string()); print("bias rata-rata (pred - aktual): %.0f MW" % E.err.mean())
 wk10 = int(sum(pd.Timestamp(i).dayofweek >= 5 for i in worst.index)); print("dari 10 hari terburuk, %d jatuh pada akhir pekan" % wk10)
-print("P90 galat absolut: %.0f MW | P99: %.0f MW | maks: %.0f MW" % (E.ae.quantile(.9), E.ae.quantile(.99), E.ae.max()))
+print("P90 error absolut: %.0f MW | P99: %.0f MW | maks: %.0f MW" % (E.ae.quantile(.9), E.ae.quantile(.99), E.ae.max()))
 RES["errors"] = dict(by_hour=[float(v) for v in by_hour.values], by_dow=[float(v) for v in by_dow.values], by_month=[float(v) for v in by_month.values],
                      daytype={k: float(v) for k, v in daytype.items()}, bias=float(E.err.mean()), p90=float(E.ae.quantile(.9)), p99=float(E.ae.quantile(.99)), max=float(E.ae.max()),
                      worst=[dict(date=str(i), mape=float(r.mape)) for i, r in worst.head(5).iterrows()], worst10_weekend=wk10)
@@ -260,6 +263,6 @@ json.dump(RES, open("results/results.json", "w"), indent=1, default=float); prin
 '''
 from cells_cluster import C3
 C.update(C3)
-ORDER = ["setup", "load", "eda", "cluster_prep", "cluster_funcs", "cluster_grid", "cluster_full", "cluster_fit", "features", "leak", "baseline", "tune", "ablation", "models", "rolling", "errors", "plots", "importance", "export", "save"]
+ORDER = ["setup", "load", "features", "split", "leak", "baseline", "tune", "cluster_prep", "cluster_funcs", "cluster_grid", "eda", "models", "plots", "ablation", "rolling", "errors", "importance", "cluster_full", "cluster_fit", "save"]
 if __name__ == "__main__":
     open("run_all.py", "w").write("\n".join(C[k] for k in ORDER))

@@ -377,7 +377,7 @@
     "n_features": 21,
     "changed_features": {}
    },
-   "seconds": 257
+   "seconds": 216
   },
   "AEP": {
    "audit": {
@@ -751,7 +751,7 @@
     "n_features": 21,
     "changed_features": {}
    },
-   "seconds": 213
+   "seconds": 186
   },
   "COMED": {
    "audit": {
@@ -1125,7 +1125,7 @@
     "n_features": 21,
     "changed_features": {}
    },
-   "seconds": 123
+   "seconds": 110
   },
   "DAYTON": {
    "audit": {
@@ -1501,7 +1501,7 @@
     "n_features": 21,
     "changed_features": {}
    },
-   "seconds": 213
+   "seconds": 184
   },
   "DEOK": {
    "audit": {
@@ -1880,7 +1880,7 @@
     "n_features": 21,
     "changed_features": {}
    },
-   "seconds": 133
+   "seconds": 116
   },
   "DOM": {
    "audit": {
@@ -2281,7 +2281,7 @@
     "n_features": 21,
     "changed_features": {}
    },
-   "seconds": 178
+   "seconds": 155
   },
   "DUQ": {
    "audit": {
@@ -2655,7 +2655,7 @@
     "n_features": 21,
     "changed_features": {}
    },
-   "seconds": 179
+   "seconds": 160
   },
   "EKPC": {
    "audit": {
@@ -3032,7 +3032,7 @@
     "n_features": 21,
     "changed_features": {}
    },
-   "seconds": 70
+   "seconds": 66
   },
   "FE": {
    "audit": {
@@ -3412,7 +3412,7 @@
     "n_features": 21,
     "changed_features": {}
    },
-   "seconds": 112
+   "seconds": 101
   },
   "PJMW": {
    "audit": {
@@ -3792,7 +3792,7 @@
     "n_features": 21,
     "changed_features": {}
    },
-   "seconds": 247
+   "seconds": 209
   }
  },
  "compare": [

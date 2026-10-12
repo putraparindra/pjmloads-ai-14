@@ -35,7 +35,7 @@ def clean_region(code):
     return yc, log
 '''
 C2["mr_audit"] = '''\
-# ---- Audit & pra-proses seluruh wilayah ----
+# ---- Audit dan pra-pemrosesan seluruh wilayah ----
 CLEAN = {}
 for code in REGIONS:
     CLEAN[code], lg = clean_region(code); RES2["regions"][code] = dict(audit=lg)
@@ -128,15 +128,15 @@ def run_region(code, y, split=SPLIT_MR, n_leak=10, export=True):
     return R_
 '''
 C2["mr_run"] = '''\
-# ---- Jalankan pipeline yang sama untuk tiap wilayah (penalaan hanya di train; uji bersama 2016-01-01 s.d. 2018-08-02) ----
+# ---- Jalankan pipeline yang sama untuk tiap wilayah (tuning hanya di train; testing bersama 2016-01-01 s.d. 2018-08-02) ----
 for code in REGIONS:
-    r_ = run_region(code, CLEAN[code], export=(code != "PJME"))        # PJME di sini hanya untuk membandingkan protokol sama; model utamanya di bagian 1-8
+    r_ = run_region(code, CLEAN[code], export=(code != "PJME"))        # PJME di sini hanya untuk membandingkan protokol sama; model utamanya ada di Bab 3.1 dan 3.2
     RES2["regions"][code].update({k: v for k, v in r_.items() if not k.startswith("_")})
     if code != "PJME":
         json.dump(dict(web=r_["_web"], model=r_["_model"], fixture=r_["_fixture"]), open(f"results/regions_out/{code}.json", "w"), separators=(",", ":"))
     h = r_["models"]["HistGradientBoosting (tuned)"]
     print(f"{code:7s} test {r_['split']['n_test']//24:4d} hari | MAE {h['MAE']:8.1f} MW | rel {h['rel']:.2f}% | R2 {h['R2']:.3f} | vs baseline {r_['skill']['mae_reduction_pct']:.1f}% | "
-          f"rolling menang {r_['rolling']['hgb_wins']}/{r_['rolling']['n']} | k={r_['cluster']['k']} | leak:{'bocor' if r_['leak_test']['changed_features'] else 'tidak ada'} | {r_['seconds']}s")
+          f"rolling menang {r_['rolling']['hgb_wins']}/{r_['rolling']['n']} | k={r_['cluster']['k']} | leakage:{'ada' if r_['leak_test']['changed_features'] else 'tidak ada'} | {r_['seconds']}s")
 '''
 C2["mr_compare"] = '''\
 # ---- Perbandingan antarwilayah (protokol sama) ----
@@ -152,7 +152,7 @@ ax[0].bar(xx - .2, o_.rel_base, .4, label="baseline terbaik"); ax[0].bar(xx + .2
 ax[1].scatter(cmp_.rata2_MW, cmp_.rel_HGB); [ax[1].annotate(w, (m, e), fontsize=9, xytext=(3, 3), textcoords="offset points") for w, m, e in zip(cmp_.wilayah, cmp_.rata2_MW, cmp_.rel_HGB)]
 ax[1].set_xscale("log"); ax[1].set_xlabel("beban rata-rata test (MW, skala log)"); ax[1].set_ylabel("relative error HGB (%)"); ax[1].set_title("Relative error vs ukuran wilayah")
 plt.tight_layout(); plt.savefig("results/fig_regions.png", bbox_inches="tight"); plt.show()
-cor_ = float(np.corrcoef(np.log(cmp_.rata2_MW), cmp_.rel_HGB)[0, 1]); print("korelasi log(beban rata-rata) vs galat relatif HGB: %.2f (n=%d wilayah; indikatif saja)" % (cor_, len(cmp_))); RES2["size_corr"] = cor_
+cor_ = float(np.corrcoef(np.log(cmp_.rata2_MW), cmp_.rel_HGB)[0, 1]); print("korelasi log(beban rata-rata) vs relative error HGB: %.2f (n=%d wilayah; indikatif saja)" % (cor_, len(cmp_))); RES2["size_corr"] = cor_
 '''
 C2["mr_save"] = '''\
 json.dump(RES2, open("results/results_regions.json", "w"), indent=1, default=float); print("results/results_regions.json tersimpan")

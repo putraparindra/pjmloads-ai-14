@@ -23,213 +23,423 @@ corr_ = R2["size_corr"]
 corr_txt = "cenderung lebih rendah pada wilayah dengan beban rata-rata lebih besar" if corr_ < -0.5 else "cenderung lebih tinggi pada wilayah dengan beban rata-rata lebih besar" if corr_ > 0.5 else "tidak menunjukkan hubungan yang jelas dengan ukuran wilayah"
 nb = nbf.v4.new_notebook(); cells = []
 md = lambda s: cells.append(nbf.v4.new_markdown_cell(s)); code = lambda k: cells.append(nbf.v4.new_code_cell(C[k] if k in C else C2[k]))
-
-md(f"""\
-# Peramalan Beban Listrik *Day-Ahead* dan Segmentasi Profil Beban Harian
-### Studi kasus: beban per jam jaringan PJM (AS): PJM East sebagai analisis utama ({D['start'][:4]}–{D['end'][:4]}), diperluas ke 9 wilayah PJM lain
-
-**Mini Project — Artificial Intelligence untuk Teknik Elektro** &nbsp;|&nbsp; Kelompok: Alfito Putra Parindra (24/534768/TK/59290) · Muhammad Fasha (24/535041/TK/59325) · Najamudin Fawwaz Haq (24/539273/TK/59804) · Qais Faqih Basyaev (24/542181/TK/60189) · Muhammad Zeva Hardi Seswanto (24/542780/TK/60292) &nbsp;|&nbsp; Teknik Elektro, Universitas Gadjah Mada
-
-Dua pendekatan AI pada satu data: **Clustering** (K-Means, dipilih lewat tuning *preprocessing* dan perbandingan algoritma) untuk mengelompokkan profil beban harian, dan **Regression**
-(HistGradientBoosting, dibandingkan dengan Random Forest, Ridge, dan baseline sederhana) untuk meramal beban tiap jam **sehari ke depan**.
-
-> **Perluasan multi-wilayah.** Analisis utama memakai PJM East (PJME). Pra-proses yang terdokumentasi dan pipeline yang sama dijalankan juga pada 9 wilayah lain (Bagian 3.2 dan 5.4); nama lengkap tiap kode wilayah tidak dijelaskan di sumber data sehingga ditulis sebagai kode saja.
->
-> **Catatan.** Beban agregat wilayah jauh lebih teratur daripada konsumsi satu rumah tangga. Akurasi yang tinggi di sini terutama berasal dari sifat data
-> (agregat, per jam, riwayat sangat berkorelasi), bukan dari model yang canggih (lihat Bagian 7).
-
-**Cara menjalankan** (dari *root* repo; Python 3.10+ dan paket di `requirements.txt`): buka notebook ini lalu *Run All* (sekitar 40 menit pada 2 CPU).
-Data dibaca dari `data_pjm/`, hasil tuning *clustering* penuh dari `cluster_tuning/` (dihasilkan terpisah oleh skrip di folder itu), dan semua keluaran (JSON, gambar) ditulis ke `results/`.
-""")
-
-md("""\
-## 1. Problem Definition
-Operator sistem tenaga harus menjadwalkan pembangkit sehari sebelumnya, sehingga membutuhkan **ramalan beban per jam untuk 24 jam ke depan**.
-Selain itu, perencana perlu memahami **bentuk khas beban harian** (kapan puncak, seberapa tinggi, pada hari seperti apa).
-
-Pertanyaan: (1) seberapa akurat beban per jam dapat diramal sehari ke depan hanya dari riwayat beban dan kalender, dibanding baseline sederhana?
-(2) apakah hari-hari dapat dikelompokkan menjadi profil beban yang bermakna?
-""")
-
-md("""\
-## 2. AI Formulation
-| Tugas | Pendekatan | Input | Output | Ukuran keberhasilan |
-|---|---|---|---|---|
-| Segmentasi profil | **Clustering** K-Means pada profil dalam MW tanpa standardisasi (*preprocessing* dan algoritma dituning; k dari Silhouette) | profil 24 jam per hari (MW) | label *cluster* per hari | Silhouette, Davies-Bouldin, stabilitas, R² rekonstruksi, kebermaknaan *cluster* |
-| Peramalan day-ahead | **Regression** HistGradientBoosting (+ RF, Ridge, baseline) | kalender + riwayat beban sampai 23:00 hari D-1 | beban (MW) tiap jam hari D | MAE, RMSE, R², **galat relatif** (MAE/rata-rata), dan penurunan galat terhadap baseline |
-
-Satu model regresi dipakai untuk semua jam (jam sebagai fitur). Tidak ada tugas klasifikasi.
-""")
-
-md(f"""\
-## 3. Data / Knowledge Preparation
-**Sumber.** *PJME_hourly.csv*: beban listrik per jam (MW) wilayah PJM East, dari data PJM Interconnection. README repositori yang kami pakai menyatakan data berasal dari situs PJM dan tersedia di Kaggle,
-dalam satuan MW, serta bahwa cakupan wilayah berubah dari tahun ke tahun. Berkas diambil dari salinan di GitHub (`panambY/Hourly_Energy_Consumption`), **bukan** langsung dari PJM; kami tidak memverifikasi ke sumber asli.
-Zona waktu stempel waktu tidak dinyatakan di sumber; kami memperlakukannya sebagai waktu lokal.
-
-**Pembersihan.** {D['rows_raw']:,} baris mentah ({D['dup']} stempel ganda, {D['missing']} jam hilang, semua gap 1 jam). Stempel ganda diambil yang pertama, jam hilang diinterpolasi linear (batas gap 6 jam),
-lalu dipakai hanya hari penuh: **{D['start']} s.d. {D['end']} = {D['hours']:,} jam / {D['days']:,} hari**. Rata-rata {f0(D['mean'])} MW, std {f0(D['std'])} MW, rentang {f0(D['mn'])}–{f0(D['mx'])} MW.
-
-**Skema peramalan & pencegahan kebocoran.** Ramalan "diterbitkan" pukul 00:00 hari D untuk 24 jam hari D. Hanya data sampai 23:00 hari D-1 yang boleh dipakai:
-semua fitur beban memakai lag ≥ 24 jam atau nilai yang dibekukan pada 23:00 D-1 (`last_obs`, `d1_mean`, dst.). Tidak ada fitur cuaca (tidak tersedia pada data).
-
-**Split.** Kronologis, tanpa pengacakan: train {S['train_start']} s.d. {S['train_end']} ({S['n_train']:,} jam), test {S['test_start']} s.d. {S['test_end']} ({S['n_test']:,} jam = {S['test_share']*100:.1f}%).
-Penalaan hanya dengan `TimeSeriesSplit(4)` di dalam train. Skala/encoding dipasang hanya pada train.
-
-**Fitur** (21 pada set final): kalender (jam, hari dalam pekan, bulan, libur federal AS menurut library `holidays`, H-1/H+1 libur); riwayat (lag 24/48/72/168/336 jam, rata-rata jam yang sama 7 hari terakhir, rata-rata 24 jam);
-dan *fitur saat-terbit* (beban pukul 23:00, 20:00, 17:00 hari D-1; rata-rata/maks/min 24 jam D-1; rata-rata 7 hari; selisih tren harian).
-""")
-code("setup"); code("load")
-md(f"""\
-### 3.2 Pra-proses seluruh wilayah (data baru: 9 wilayah PJM lain)
-Berkas tambahan berformat sama dengan PJME (kolom `Datetime` dan beban MW). Sepuluh seri dipakai: {", ".join(R2["regions"].keys())}. Dua seri dikecualikan: **NI** (berhenti Januari 2011) dan **PJM_Load** (berhenti Januari 2002); cakupan wilayahnya berbeda dari seri lain dan tidak ada data baru untuk periode uji.
-Aturan pra-proses yang sama untuk semua wilayah, dan setiap langkah dihitung dampaknya di tabel di bawah:
-1. stempel waktu ganda (pergantian jam musim) → ambil yang pertama; 2. jam yang hilang → NaN; 3. nilai tak masuk akal (≤ 0, atau < 35% dari median lokal pada jam-dalam-pekan yang sama, jendela 9 minggu) → NaN; 4. gap ≤ 6 jam → interpolasi linear; 5. hanya hari penuh dipakai.
-Nilai antara 35% dan 50% dari median lokal **dicatat tetapi dibiarkan**, karena tidak bisa dibuktikan salah. Nilai tinggi (> 1,6× median lokal) tidak dibuang: puncak beban nyata (cuaca ekstrem) wajar bernilai tinggi.
-""")
-code("mr_setup"); code("mr_clean"); code("mr_audit")
-md(f"""\
-**Hasil audit.** Setiap wilayah punya {sorted(set(RG_[c]['audit']['dup'] for c in CMP))[0]} stempel ganda (pergantian jam musim) dan hanya gap 1 jam (gap terpanjang {max(RG_[c]['audit']['longest_gap'] for c in CMP)} jam), jadi interpolasi dibatasi pada kasus paling ringan.
-Nilai tak masuk akal yang dibuang: {"; ".join(f"**{c}** {a['t'][:13]} ({f0(a['nilai'])} MW, {a['rasio']*100:.0f}% dari median lokal)" for c, a in anom_all)}.
-Nilai diragukan yang **dibiarkan**: {"; ".join(f"{c} ({v} jam; terbanyak pada " + ", ".join(f"{d} ({k} jam)" for d, k in RG_[c]["audit"]["border_days"].items()) + ")" for c, v in bord.items())}. Yang jatuh di periode uji (mulai {R2["split"]}) dapat menaikkan galat wilayah itu sedikit: {", ".join(in_test) if in_test else "tidak ada"}; sisanya jatuh di periode train. Kami tidak dapat memeriksanya ke sumber asli.
-""")
-code("eda")
-md(f"""\
-**Catatan EDA.** Pola khas: beban terendah dini hari, dua musim puncak (musim panas dan dingin, kemungkinan karena pendingin dan pemanas ruang), dan akhir pekan lebih rendah
-(rata-rata Sabtu {f0(R['eda']['dow_mean'][5])} MW dan Minggu {f0(R['eda']['dow_mean'][6])} MW, dibanding Senin {f0(R['eda']['dow_mean'][0])} MW).
-""")
-
-md("## 4. Implementation\n### 4.1 Clustering profil beban harian\nSatu baris = satu hari, 24 kolom = beban tiap jam. Ini analisis **deskriptif** (memakai data hari itu sendiri), bukan prediksi, sehingga tidak ada isu kebocoran. Bagian ini terdiri dari: (a) tuning *preprocessing* dan perbandingan algoritma, (b) pemilihan konfigurasi akhir, (c) hasil dan interpretasinya.")
 CT = R["cluster_tuning"]; PR = {(p["prep"], p["alg"]): p for p in CT["pairs"]}
 top = CT["pjme_top10"][0]; kraw = PR[("raw_MW", "kmeans")]; sh = PR[("bentuk_z + level", "kmeans")]; spc = PR[("std_per_jam (awal)", "spectral")]
+import os, re
+RT = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "report_text.json"), encoding="utf8"))
+
+def ref(t):
+    """Teks narasi laporan memakai nomor tabel/gambar; di notebook keluarannya muncul di sel, sehingga rujukan dibuat relatif."""
+    t = t.replace("pada Tabel 12", "pada hasil uji berpasangan di atas")
+    t = t.replace("(Subbab 4.3)", "(Subbab 3.1.3)").replace("(Subbab 5.7)", "(Subbab 3.2.7)").replace("(Subbab 6.3)", "(Subbab 3.3.3)")
+    t = t.replace("(Gambar 7), angka-angka", "(Subbab 3.2.7), angka-angka")
+    t = t.replace("akhir pekan (Gambar 1).", "akhir pekan (Subbab 3.2.1).").replace("beban puncak (Gambar 3)", "beban puncak (Subbab 3.2.5)")
+    t = t.replace("(Gambar 4 dan Tabel 7)", "(Subbab 3.2.3 dan 3.2.5)").replace("prediksi diterbitkan", "prediksi dibuat")
+    t = re.sub(r"\(Gambar \d+ dan Tabel \d+\)", "(lihat gambar dan tabel di atas)", t)
+    t = re.sub(r"\(Gambar \d+\)", "(lihat gambar di atas)", t)
+    t = re.sub(r"Pada (Tabel|Gambar) \d+", lambda m: "Pada " + ("tabel" if m.group(1) == "Tabel" else "gambar") + " di atas", t)
+    t = re.sub(r"Berdasarkan Tabel \d+", "Berdasarkan tabel di atas", t)
+    t = re.sub(r"Tabel \d+ menunjukkan", "Tabel di atas menunjukkan", t)
+    t = re.sub(r"Tabel \d+", "tabel di atas", t)
+    t = re.sub(r"Gambar \d+", "gambar di atas", t)
+    return t.strip()
+P = lambda k: ref(RT[k])
+
+# ---- pemeriksaan: angka pada narasi statis harus sama dengan keluaran notebook (results/*.json) ----
+_chk = [(f0(H["MAE"]), "con0"), (f0(H["RMSE"]), "con0"), (f3(H["R2"]), "con0"), (f2(H["rel"]), "con0"), (f1(SK["mae_reduction_pct"]), "con0"),
+        (f0(BB["MAE"]), "reg1"), (f3(BB["R2"]), "reg1"), (f0(AB[0]["MAE"]), "abl"), (f0(AB[2]["MAE"]), "abl"), (f2(RO["rel_hgb_mean"]), "roll"),
+        (f0(CL["summary"][0]["n_hari"]), "cl_c1"), (f0(CL["summary"][1]["n_hari"]), "cl_c1"), (f3(sil[2]["silhouette"] if isinstance(sil[2], dict) else sil[2]), "cl_sil"),
+        (f0(ER["p99"]), "err3"), (f1(tmin), "mr1"), (f1(tmax), "mr1")]
+for _v, _k in _chk: assert _v in RT[_k], (_v, _k)
+
+# =====================================================================================================================
 md(f"""\
-#### 4.1.1 Rancangan tuning
-**Yang dibandingkan** (data PJME, {CT['pjme_n_total']} konfigurasi, k = 2..6):
-- *Preprocessing* (10): MW mentah; standardisasi per jam (konfigurasi awal); *robust scaling*; *min-max*; log lalu standardisasi; bentuk saja (z-score per hari); rasio terhadap rata-rata harian; bentuk + level; PCA 95% variansi; PCA 3 komponen.
-- Algoritma (6): K-Means, *Gaussian Mixture* (kovarians *full* dan *diagonal*), *Agglomerative* (Ward dan *average*), *Spectral clustering*.
-- Ukuran: Silhouette, Davies-Bouldin, Calinski-Harabasz, **stabilitas** (rata-rata ARI antara dua *subsample* 70% pada hari yang sama), dan **R² rekonstruksi** (seberapa baik rata-rata *cluster* mewakili profil MW tiap hari).
+# Prediksi Beban Listrik per Jam Satu Hari ke Depan (*Day-Ahead Load Forecasting*) dan Segmentasi Profil Beban Harian pada Jaringan PJM
+**Laporan Mini-Project *Machine Learning* · Kecerdasan Artifisial (TKEE262513)** &nbsp;|&nbsp; **Kelompok 14:** Alfito Putra Parindra (24/534768/TK/59290) · Muhammad Fasha (24/535041/TK/59325) · Najamudin Fawwaz Haq (24/539273/TK/59804) · Qais Faqih Basyaev (24/542181/TK/60189) · Muhammad Zeva Hardi Seswanto (24/542780/TK/60292) &nbsp;|&nbsp; Departemen Teknik Elektro dan Teknologi Informasi, Fakultas Teknik, Universitas Gadjah Mada, 2026
 
-**Masalah perbandingan yang adil.** Silhouette dihitung di ruang fitur masing-masing konfigurasi, sehingga tidak bisa dibandingkan antar-*preprocessing* (jarak di ruang berbeda). Karena itu dipakai dua ruang pembanding netral: S1 (standardisasi per jam) dan S2 (bentuk saja). `score` = rata-rata Silhouette di S1 dan S2.
+Dua pendekatan AI pada satu data beban per jam jaringan PJM (Amerika Serikat, {D['start'][:4]}–{D['end'][:4]}): ***regression*** (HistGradientBoosting, dibandingkan dengan Random Forest, Ridge, dan *baseline* sederhana) untuk memprediksi beban tiap jam **sehari ke depan**, dan ***clustering*** (K-Means, dipilih lewat *tuning preprocessing* dan perbandingan algoritma) untuk mengelompokkan profil beban harian. PJM East (PJME) menjadi analisis utama, lalu pipeline yang sama dijalankan pada 9 wilayah PJM lain.
 
-**Aturan seleksi (ditetapkan sebelum melihat hasil):** pilih `score` tertinggi dengan stabilitas ≥ 0,8 dan *cluster* terkecil ≥ 5% hari. Sebanyak {CT['pjme_n_eligible']} dari {CT['pjme_n_total']} konfigurasi memenuhi syarat.
+Notebook ini mengikuti struktur laporan: **Bab 1** Pendahuluan, **Bab 2** Metode dan Model AI (*AI formulation* dan *data/knowledge preparation*), **Bab 3** Hasil dan Pembahasan (*implementation*, *results*, *evaluation*, *engineering interpretation*), dan **Bab 4** Kesimpulan. Pada *implementation* dan *results*, *regression* dibahas lebih dulu karena merupakan model utama, dan *clustering* menyusul sebagai analisis pendukung.
+
+**Cara menjalankan** (dari *root* repo; Python 3.10+ dan paket di `requirements.txt`): buka notebook ini lalu *Run All* (sekitar 40 menit pada 2 CPU). Data dibaca dari `data_pjm/`, hasil *tuning clustering* penuh dari `cluster_tuning/` (dihasilkan terpisah oleh skrip di folder itu), dan semua keluaran (JSON, gambar) ditulis ke `results/`.
+
+> **Catatan.** Beban agregat wilayah jauh lebih teratur daripada konsumsi satu rumah tangga. Akurasi yang tinggi di sini terutama berasal dari sifat data (agregat, per jam, riwayat sangat berkorelasi), bukan dari model yang canggih (lihat Subbab 3.4).
+""")
+
+# ---------------------------------------------------------------- BAB 1
+md("""\
+## BAB 1. PENDAHULUAN
+### 1.1 Latar Belakang
+Listrik merupakan infrastruktur yang menopang hampir seluruh kegiatan ekonomi dan sosial, dan kebutuhannya di Indonesia terus bertambah. Konsumsi listrik per kapita Indonesia mencapai 1.285 kWh pada Oktober 2023 [1], sedangkan ESDM menyebut rata-rata ASEAN sebesar 3.672 kWh per kapita [2]. Pemerintah menargetkan tambahan kapasitas pembangkit 69,5 GW dalam RUPTL 2025–2034 [3], dan PLN memproyeksikan kebutuhan listrik naik dari 306 TWh menjadi 511 TWh pada 2034 [4]. Pertumbuhan ini harus dikelola oleh operator sistem yang setiap saat menyeimbangkan daya yang dibangkitkan dengan daya yang dikonsumsi.
+
+Sistem Jawa-Bali menunjukkan skala masalahnya. Beban puncak malam sistem ini tercatat 27.070 MW pada 17 Oktober 2018 [5], dan kelebihan pasok (*oversupply*) turun dari 7 GW pada akhir 2022 menjadi 4 GW pada akhir 2023 [6]. Prediksi beban yang terlalu rendah berisiko membuat cadangan daya tidak mencukupi, sedangkan prediksi yang terlalu tinggi membuat pembangkit beroperasi lebih banyak dari kebutuhan. Di sisi lain, 42,6 GW dari 69,5 GW kapasitas baru dalam RUPTL berasal dari energi terbarukan dan 10,3 GW dari penyimpanan energi [3], sehingga perencanaan operasi harian makin menuntut prediksi beban yang akurat. Nilai ekonominya pun nyata: perkiraan kasar menyebut penurunan *error* prediksi beban jangka pendek sebesar 1 poin persentase (MAPE dari 4% menjadi 3%) menghemat sekitar US$300.000 per tahun untuk utilitas dengan beban puncak 1 GW [7].
+
+Prediksi beban jangka pendek dengan *machine learning* sudah diteliti pada sistem Indonesia. Ainuri dkk. memakai *Long Short-Term Memory* (LSTM) pada sistem Jawa-Bali dan memperoleh MAPE 5,67% serta RMSE 1.683,09 MW pada model terbaiknya [8]. Namun, dalam penelusuran kami tidak ditemukan data beban per jam sistem Indonesia yang dapat diunduh secara publik, sehingga metode sulit direproduksi dan dibandingkan secara terbuka. Sebagai gantinya, data beban per jam PJM Interconnection tersedia secara publik [9]–[13]. PJM melayani 65 juta penduduk di 13 negara bagian dan District of Columbia, dengan perkiraan beban puncak musim panas sekitar 149.000 MW dan kapasitas terpasang sekitar 185.000 MW [14]. Skala ini cukup besar untuk menguji metode pada beberapa wilayah dengan karakter beban berbeda.
+
+Berdasarkan uraian tersebut, mini project ini membangun model prediksi beban *day-ahead* per jam dengan HistGradientBoosting (HGB) pada data PJM, dan mengelompokkan hari berdasarkan profil beban 24 jam dengan K-Means. Model diuji pada sepuluh wilayah dengan pembagian data kronologis dan dibandingkan dengan *baseline* sederhana, sehingga peningkatan akurasinya dapat diukur secara terbuka. Hasilnya diharapkan menjadi acuan metode yang dapat diterapkan pada data beban sistem Indonesia ketika data tersebut tersedia.
+
+### 1.2 Input, Output, dan Perangkat Uji Coba
+Masukan, keluaran, dan perangkat uji coba sistem pada setiap pendekatan AI disajikan dalam Tabel 1 sebagai berikut.
+
+*Tabel 1. Input, output, dan perangkat uji coba sistem.*
+
+| Komponen | Keterangan |
+|---|---|
+| Input (*regression*) | Informasi kalender, meliputi jam, hari dalam pekan, bulan, dan hari libur nasional Amerika Serikat, serta riwayat beban yang tersedia hingga pukul 23:00 hari D−1. |
+| Output (*regression*) | Sebanyak 24 nilai prediksi beban dalam MW, masing-masing untuk setiap jam pada hari D. |
+| Input (*clustering*) | Satu profil beban yang terdiri atas 24 nilai per jam untuk setiap hari. |
+| Output (*clustering*) | Label *cluster* setiap hari dan uraian karakteristik masing-masing *cluster*. |
+| Bahasa pemrograman | Python 3.11 |
+| *Library* | pandas 3.0, NumPy 2.4, Matplotlib 3.10, scikit-learn 1.8 [15], *holidays* 0.106 [16] |
+| *Platform* | Jupyter Notebook (`pjm_load_forecasting.ipynb`) |
+| Sistem operasi | Linux |
+| Perangkat keras | 2 CPU, RAM 7 GB, tanpa GPU |
+| *Random seed* | 42 |
+""")
+
+md(f"""\
+### 1.3 Tujuan Penggunaan AI
+Beban listrik dipengaruhi oleh pola harian, mingguan, dan tahunan, serta keberadaan hari libur. Pengaruh berbagai pola tersebut terhadap besarnya beban tidak bersifat linear dan dapat saling berinteraksi. Sebagai contoh, profil beban harian pada musim panas dapat berbeda dari musim dingin, sebagaimana profil hari kerja dapat berbeda dari akhir pekan. Keragaman kombinasi tersebut sulit diwakili secara menyeluruh melalui aturan IF–THEN.
+
+*Machine learning* memungkinkan hubungan tersebut dipelajari dari data historis dalam jumlah besar. Pada wilayah PJME, tersedia {f0(D['rows_raw'])} baris data mentah yang digunakan sebagai dasar analisis. Dengan pendekatan ini, pola beban diidentifikasi melalui pembelajaran dari data, sehingga tidak bergantung pada penyusunan aturan secara manual.
+
+### 1.4 Batasan Masalah
+Batasan ruang lingkup mini project ini ditetapkan sebagai berikut.
+1. Informasi yang digunakan model terbatas pada kalender dan riwayat beban. Karena *dataset* tidak menyediakan data cuaca, pengaruh suhu tidak dimodelkan.
+2. Prediksi dibuat satu kali setiap hari, yaitu pukul 00:00, untuk mencakup 24 jam pada hari tersebut (*day-ahead*).
+3. Analisis dilakukan pada 10 wilayah PJM. Seri NI dan PJM_Load yang juga tersedia dalam paket data tidak disertakan karena masing-masing berakhir pada Januari 2011 dan Januari 2002, sehingga tidak mencakup periode *testing*.
+4. Data yang dianalisis berasal dari Amerika Serikat. Oleh karena itu, hasil yang diperoleh belum tentu dapat diterapkan secara langsung pada sistem kelistrikan Indonesia.
+5. Keluaran model berupa satu nilai prediksi untuk setiap jam, tanpa menyertakan *prediction interval*.
+""")
+
+# ---------------------------------------------------------------- BAB 2
+md("""\
+## BAB 2. METODE DAN MODEL AI
+### 2.1 AI Formulation
+Pendekatan kecerdasan artifisial yang digunakan pada proyek adalah *regression* dalam prediksi beban dengan keluaran yang diprediksi berupa nilai numerik kontinu, yaitu beban listrik dalam MW. Sementara itu, digunakan *clustering* (K-Means) sebagai analisis pendukung untuk mengelompokkan profil beban harian tanpa label kelas. Hasil *clustering* dipakai untuk membantu menjelaskan karakteristik data dan tidak dipakai sebagai masukan model *regression*. Formulasi AI yang digunakan pada proyek ditunjukkan pada Tabel 2 sebagai berikut.
+
+*Tabel 2. Formulasi AI yang digunakan.*
+
+| Tujuan | Pendekatan | Masukan/Input | Keluaran/Output dan Evaluasi |
+|---|---|---|---|
+| Prediksi beban *day-ahead* | *Regression*: HistGradientBoosting (HGB) dengan pembanding Random Forest, Ridge, dan empat *baseline*. | Kalender dan riwayat beban sampai 23:00 hari D-1 (21 *feature*) | Beban (MW) tiap jam pada hari D; MAE, RMSE, R², *relative error* |
+| Segmentasi profil beban harian | *Clustering*: K-Means pada profil dalam MW tanpa standardisasi, hasil *tuning preprocessing* dan perbandingan 6 algoritma; jumlah *cluster* (k) dipilih dengan Silhouette Score | Profil 24 jam per hari dalam MW | Label *cluster*; Silhouette Score, Davies-Bouldin Index, stabilitas, R² rekonstruksi |
+
+Pendekatan utama yang dipilih adalah *regression*, dengan HGB sebagai model utama karena data berbentuk tabel dengan banyak *feature* campuran dan jumlah data yang cukup besar, serta mampu menangkap interaksi antar-*feature* tanpa rekayasa manual. Input model berupa kalender dan riwayat beban sampai pukul 23:00 hari D-1, sedangkan output berupa beban listrik tiap jam pada hari D. HGB dibandingkan dengan Random Forest dan Ridge Regression untuk melihat apakah peningkatan akurasi berasal dari algoritma atau dari *feature* yang digunakan. Empat *baseline* tanpa proses *learning* juga dipakai sebagai pembanding minimum, sehingga ketika model tidak lebih baik dari *baseline* tersebut, penggunaan *machine learning* tidak memberikan manfaat. Pada proyek ini, satu model dipakai untuk seluruh jam dalam sehari, dengan jam sebagai salah satu *feature*.
+
+Pendekatan pendukung adalah *clustering* dengan *unsupervised learning*, karena data beban tidak memiliki label jenis hari sehingga mampu untuk meringkas pola beban harian dalam pengelompokan sesuai dengan kemiripan bentuk profil. Input berupa profil beban 24 jam per hari dan output berupa label *cluster* untuk tiap hari dengan algoritma yang dipakai adalah K-Means. K-Means mengelompokkan setiap hari ke pusat *cluster* (*centroid*) terdekat dengan *centroid* berupa rata-rata profil beban dalam MW sehingga setiap *cluster* mudah dibaca dan dikaitkan dengan musim atau akhir pekan. Pada proyek ini, jumlah *cluster* (k) ditentukan dari Silhouette Score.
+
+### 2.2 Data/Knowledge Preparation
+#### 2.2.1 Sumber dan Karakteristik Dataset
+""")
+md(f"""\
+Data yang digunakan pada proyek ini adalah data riil/nyata dari *open-public sources* sebagai berikut.
+1. Repositori GitHub: panambY (Hourly_Energy_Consumption) [13]
+2. Repositori Kaggle: robikscube (Hourly Energy Consumption) [9]
+3. Repositori Kaggle: ashishkumarrana (PJM Hourly Energy Consumption) [10]
+4. Repositori GitHub: navyasancheti (PJME-Hourly-Energy-Consumption) [12]
+5. IEEE DataPort: PJM Hourly Energy Consumption [11]
+
+Berkas *PJME_hourly.csv* dibaca dari repositori panambY [13], sedangkan berkas sembilan wilayah lainnya berasal dari paket data yang diunggah tim. README pada [13] menyatakan bahwa data berasal dari situs PJM, dinyatakan dalam satuan MW, dan cakupan wilayahnya berubah dari tahun ke tahun. Data **tidak** diambil langsung dari PJM dan tidak diverifikasi ke sumber aslinya. Zona waktu pada *timestamp* tidak dijelaskan di sumber sehingga diperlakukan sebagai waktu lokal. Nama lengkap tiap kode wilayah juga tidak dijelaskan di sumber, sehingga ditulis sebagai kode saja.
+
+Setiap berkas terdiri atas dua kolom, yaitu *Datetime* (*timestamp* per jam) dan beban listrik dalam MW. Pada PJME terdapat {f0(D['rows_raw'])} baris mentah, yang mencakup {D['dup']} *timestamp* ganda dan {D['missing']} jam yang hilang (*missing value*), seluruhnya berupa celah sepanjang 1 jam. Data PJME yang dipakai mencakup {D['start']} sampai {D['end']} dengan {f0(D['hours'])} jam ({f0(D['days'])} hari). Beban rata-rata {f0(D['mean'])} MW dengan simpangan baku {f0(D['std'])} MW, nilai minimum {f0(D['mn'])} MW, dan nilai maksimum {f0(D['mx'])} MW. Sel di bawah memuat dan membersihkan data PJME; keluarannya menampilkan angka-angka tersebut.
+""")
+code("setup"); code("load")
+
+md("""\
+#### 2.2.2 Pra-pemrosesan Data
+Pra-pemrosesan data atau *preprocessing* dilakukan dengan aturan yang sama pada semua wilayah. Pertama, *duplicate timestamp* yang muncul akibat pergantian *daylight saving time* diambil yang pertama. Kedua, data diubah menjadi *hourly time series* tanpa *gap*, sehingga jam yang hilang menjadi *missing value*. Ketiga, *outlier*, yaitu nilai nol, nilai negatif, atau nilai di bawah 35% dari *local median* pada *hour-of-week* yang sama (*window* 9 minggu), diubah menjadi *missing value*. Keempat, *gap* sampai 6 jam diisi dengan *linear interpolation*. Kelima, hanya *complete day* (24 jam penuh) yang dipakai. Nilai tinggi tidak dibuang karena *peak load* yang ekstrem merupakan kondisi nyata yang justru perlu diprediksi. Nilai di antara 35% dan 50% dari *local median* dicatat sebagai *suspicious value*, tetapi tetap dipertahankan karena tidak dapat dibuktikan salah. Hasilnya untuk setiap wilayah dihitung oleh sel berikut dan diringkas pada Tabel 3.
+""")
+code("mr_setup"); code("mr_clean"); code("mr_audit")
+_rows3 = "\n".join(f"| {c} | {RG_[c]['audit']['start'][:7]} s.d. {RG_[c]['audit']['end'][:7]} | {f0(RG_[c]['audit']['days'])} | {RG_[c]['audit']['missing_hours']} | {RG_[c]['audit']['dup']} | {RG_[c]['audit']['n_anomalies']} | {RG_[c]['audit']['borderline']} |" for c in RG_)
+md(f"""\
+*Tabel 3. Hasil pra-pemrosesan data setiap wilayah.*
+
+| Wilayah | Periode | Hari | *Missing hour* | *Duplicate timestamp* | *Removed value* | *Suspicious value* |
+|---|---|---:|---:|---:|---:|---:|
+{_rows3}
+
+Berdasarkan tabel di atas, setiap wilayah hanya memiliki *gap* data sepanjang 1 jam (*gap* terpanjang 1 jam) dan 4 *duplicate timestamp*. Jumlah *missing hour* tergolong sangat kecil dibanding jumlah data sehingga *interpolation* tidak mengubah pola beban secara berarti. *Outlier* yang dibuang hanya 3 titik, yaitu DOM pada 2009-12-12 00:00 (1.253 MW, 14% dari *local median*); FE pada 2011-06-01 01:00 (0 MW, 0% dari *local median*); PJMW pada 2003-05-29 00:00 (487 MW, 10% dari *local median*). *Suspicious value* yang dipertahankan terdapat pada DAYTON (1 jam), DEOK (30 jam), EKPC (10 jam). Pada DEOK, 29 dari 30 jam tersebut berada pada 22–25 April 2018 (21 jam pada 22 April) sehingga masuk ke periode *testing* dan dapat sedikit menaikkan *error* DEOK. Pada EKPC, 10 jam tersebut berada pada tahun 2013 (periode *training*). Pemeriksaan ini hanya berdasarkan aturan, tidak diverifikasi ke sumber asli.
+""")
+
+md("""\
+#### 2.2.3 Pembentukan Feature dan Target
+*Target* yang diprediksi adalah beban pada jam *t* (MW). Prediksi dibuat pukul 00:00 hari *D* untuk 24 jam hari *D*, sehingga hanya data sampai pukul 23:00 hari *D-1* yang boleh dipakai. Oleh karena itu, setiap *feature* berbasis beban memakai *lag* minimal 24 jam atau nilai *snapshot* pada pukul 23:00 hari *D-1*. Aturan ini mencegah *data leakage*, yaitu masuknya informasi dari waktu yang sedang diprediksi ke dalam *feature*. Seluruh 21 *feature* dirinci pada Tabel 4 berikut.
+
+*Tabel 4. Daftar feature yang digunakan.*
+
+| Kelompok | Nama *feature* | Keterangan |
+|---|---|---|
+| Kalender (6) | `hour`, `dow`, `month` | Jam (0–23), hari dalam pekan (0 = Senin), dan bulan |
+| | `is_hol`, `hol_prev`, `hol_next` | Penanda hari libur nasional AS pada hari D, hari sebelumnya, dan hari sesudahnya (*library* `holidays`) |
+| *Lag* (6) | `lag24`, `lag48`, `lag168`, `lag336` | Beban pada jam yang sama 1, 2, 7, dan 14 hari sebelumnya |
+| | `wk_mean` | Rata-rata beban pada jam yang sama selama 7 hari terakhir |
+| | `dmean_prev` | Rata-rata beban 24 jam yang berakhir pada jam t−24 |
+| *Snapshot* D-1 (9) | `last_obs`, `last_obs_m3`, `last_obs_m6` | Beban pukul 23:00, 20:00, dan 17:00 pada hari D-1 |
+| | `d1_mean`, `d1_max`, `d1_min` | Rata-rata, maksimum, dan minimum beban 24 jam yang berakhir pukul 23:00 hari D-1 |
+| | `w1_mean`, `d1_trend` | Rata-rata beban 7 hari yang berakhir pukul 23:00 hari D-1, dan selisih `d1_mean` dengan rata-rata 24 jam sebelumnya |
+| | `lag72` | Beban pada jam yang sama 3 hari sebelumnya |
+""")
+code("features")
+
+md(f"""\
+#### 2.2.4 Pembagian Data dan Uji Data Leakage
+Data dibagi secara kronologis (*chronological split*) tanpa *shuffling*. Data *training* mencakup {S['train_start']} sampai {S['train_end']} ({f0(S['n_train'])} jam), sedangkan data *testing* mencakup {S['test_start']} sampai {S['test_end']} ({f0(S['n_test'])} jam, {f1(S['test_share']*100)}% dari seluruh data). Pembagian kronologis dipilih karena pada kondisi nyata model selalu memprediksi masa depan dari data masa lalu. *Hyperparameter tuning* hanya dilakukan di dalam data *training*, dan *scaling* serta *encoding* hanya di-*fit* pada data *training*. Untuk analisis sepuluh wilayah, periode *testing* disamakan, yaitu 2016-01-01 sampai 2018-08-02, agar hasil antarwilayah dapat dibandingkan.
+""")
+code("split")
+md("""\
+*Data leakage* diuji dengan *perturbation test*. Seluruh nilai beban pada satu hari *D* diganti dengan angka acak, kemudian semua 21 *feature* dihitung ulang. Jika ada *feature* pada jam-jam hari *D* yang ikut berubah, berarti *feature* tersebut memuat informasi dari hari yang sedang diprediksi. Pada 25 hari acak, tidak ada satu pun *feature* yang berubah. Hasil yang sama diperoleh pada 9 wilayah lain (10 hari acak per wilayah). Dengan demikian, rancangan *feature* memenuhi aturan bahwa hanya data sampai pukul 23:00 hari *D-1* yang digunakan.
+""")
+code("leak")
+
+# ---------------------------------------------------------------- BAB 3.1
+md("""\
+## BAB 3. HASIL DAN PEMBAHASAN
+### 3.1 Implementation
+#### 3.1.1 Alur Implementasi
+Alur sistem proyek dilakukan berdasarkan *workflow* yang ditunjukkan diagram alir pada Gambar 1 sebagai berikut.
+
+![Gambar 1. Diagram alir implementasi model AI](report/gambar_alur_implementasi.png)
+
+*Gambar 1. Diagram alir implementasi model AI.*
+""")
+
+md(f"""\
+#### 3.1.2 Regression Day-Ahead
+Model utama adalah *HistGradientBoostingRegressor* dari scikit-learn. Model ini membangun banyak *decision tree* secara berurutan, dengan setiap *tree* memperbaiki sisa *error* dari *tree* sebelumnya, dan memakai histogram untuk mempercepat pencarian titik pemisah. Model ini pun dilakukan *tuning* dengan *hyperparameter tuning* menggunakan *GridSearchCV* pada {TU['grid_size']} kombinasi parameter, *cross-validation* berbasis *TimeSeriesSplit* dengan 4 *fold*, dan skor MAE. Seluruh proses ini hanya memakai data *training*. Parameter terbaik adalah *learning_rate* {f2(TU['best']['learning_rate'])}, *max_iter* {TU['best']['max_iter']}, *max_leaf_nodes* {TU['best']['max_leaf_nodes']}, dan *min_samples_leaf* {TU['best']['min_samples_leaf']}.
+""")
+code("tune")
+md("""\
+Hasil yang diperoleh dibandingkan dengan pembanding, yaitu Random Forest (300 *tree*, *min_samples_leaf* 5, *max_features* 0,5) dan Ridge Regression (alpha 10) dengan *one-hot encoding* untuk *feature* kalender. Empat *baseline* tanpa proses *learning* juga dihitung (sel berikut): (1) persistensi harian (lag24), yaitu beban pada jam yang sama kemarin; (2) persistensi mingguan (lag168), yaitu beban pada jam yang sama minggu lalu; (3) rata-rata lag24, lag48, dan lag168; serta (4) rata-rata beban pada jam yang sama selama 7 hari terakhir. Model harus mengalahkan *baseline* terbaik agar dianggap memiliki kemampuan prediksi.
+""")
+code("baseline")
+
+md(f"""\
+#### 3.1.3 Clustering Profil Beban Harian
+Pada proyek ini, setiap hari direpresentasikan oleh 24 nilai beban per jam ({f0(D['days'])} hari lengkap pada PJME). Analisis tersebut bersifat deskriptif karena memakai data hari itu sendiri sehingga tidak ada isu *data leakage*. Sementara itu, konfigurasi awal memakai data yang distandarkan per jam dan K-Means dengan k dipilih dari Silhouette Score. Konfigurasi tersebut kemudian dilakukan *tuning* dan dibandingkan dengan algoritma lain. Rancangan konfigurasi tersebut dirinci sebagai berikut.
+1. ***Preprocessing* (10 varian):** standardisasi per jam (konfigurasi awal), MW asli tanpa standardisasi, *robust scaling*, *min-max*, log lalu standardisasi, bentuk saja (*z-score* per hari), bentuk saja (rasio ke rata-rata harian), bentuk + level (bentuk ditambah rata-rata harian terstandar), PCA 95% variansi, dan PCA 3 komponen.
+2. **Algoritma (6 jenis):** K-Means, *Gaussian Mixture Model* (kovarians *full* dan *diagonal*), *Agglomerative clustering* (*linkage* Ward dan *average*), serta *spectral clustering*. Jumlah *cluster* k diuji dari 2 sampai 6, sehingga totalnya {CT['pjme_n_total']} konfigurasi pada PJME.
+3. **Ukuran:** Silhouette Score, Davies-Bouldin Index, Calinski-Harabasz, stabilitas, dan R² rekonstruksi. Stabilitas adalah rata-rata *Adjusted Rand Index* (ARI) antara dua hasil *clustering* pada dua *subsample* acak 70% data, dibandingkan pada hari yang sama (5 ulangan). R² rekonstruksi menunjukkan seberapa besar variasi profil MW yang dijelaskan oleh rata-rata *cluster*.
+
+Silhouette Score dihitung di ruang *feature* milik tiap konfigurasi, sehingga angkanya tidak bisa dibandingkan langsung antar-*preprocessing* karena jarak diukur di ruang yang berbeda. Untuk perbandingan, setiap hasil *clustering* dinilai ulang di dua ruang pembanding netral, yaitu S1 (data distandarkan per jam) dan S2 (bentuk profil saja, *z-score* per hari), dan *score* didefinisikan sebagai rata-rata Silhouette di S1 dan S2. Sebelum hasil dilihat, ditetapkan aturan seleksi: pilih konfigurasi dengan *score* tertinggi yang memiliki stabilitas minimal 0,8 dan *cluster* terkecil minimal 5% dari seluruh hari. Perbedaan antar-kandidat teratas diuji dengan 10 kali *subsample* 70% berpasangan (kandidat dan K-Means standar dinilai pada *subsample* yang sama). Pengujian diulang pada 9 wilayah lain dengan 5 konfigurasi terpilih.
 """)
 code("cluster_prep"); code("cluster_funcs"); code("cluster_grid")
+md(f"""\
+Sel di atas menjalankan **grid ringkas** di dalam notebook (semua *preprocessing* dengan K-Means, plus GMM diagonal, Ward, dan *spectral* pada data standar). Grid penuh ({CT['pjme_n_total']} konfigurasi) dan pengujian pada 9 wilayah lain dijalankan lewat skrip terpisah `cluster_tune.py`, `cluster_pairs.py`, dan `cluster_regions.py` di folder `cluster_tuning/` karena memakan waktu lama. Hasilnya (`cluster_tune_*.json`) dimuat dan dibahas pada Subbab 3.2.7.
+
+#### 3.1.4 Evaluasi Tambahan
+Empat analisis tambahan dilakukan di luar evaluasi pada satu periode *testing*. *Ablation study* membandingkan tiga kelompok *feature* (kalender saja; kalender dan *lag*; semua *feature*) untuk melihat kontribusi tiap kelompok. Evaluasi *rolling-origin* mengulang proses *training* dan *testing* pada 8 periode berurutan (masing-masing sekitar 6 bulan) untuk melihat konsistensi hasil terhadap waktu. Analisis *error* melihat sebaran *error* menurut jam, bulan, dan jenis hari. *Permutation importance* mengukur seberapa besar MAE naik ketika nilai suatu *feature* diacak. Keempatnya dijalankan pada Subbab 3.2.3 sampai 3.2.5.
+
+#### 3.1.5 Pipeline Multi-Wilayah
+Setiap wilayah dilatih dengan model tersendiri menggunakan *pipeline* yang sama, yaitu 21 *feature* yang sama, empat *baseline*, *tuning* HGB pada grid 8 kombinasi dengan *TimeSeriesSplit* 4 *fold*, pembanding Ridge, evaluasi *rolling-origin*, *clustering* K-Means, dan *perturbation test*. Terdapat beberapa perbedaan dengan analisis utama PJME.
+1. Periode *testing* disamakan pada 2016-01-01 sampai 2018-08-02 untuk semua wilayah. Wilayah dengan data pendek seperti EKPC (mulai pertengahan 2013) tetap memiliki data *training* sekitar 2,6 tahun. PJME diulang pada protokol ini hanya untuk tabel perbandingan, sedangkan hasil utama PJME (*testing* mulai 2015) tidak diubah. Karena itu, angka PJME pada tabel perbandingan sedikit berbeda dari hasil utama.
+2. Set *feature* dan rentang *hyperparameter* tidak disetel ulang untuk tiap wilayah karena keduanya dirancang pada PJME. Untuk wilayah lain, hanya nilai *hyperparameter* yang dicari ulang pada data *training*.
+3. Untuk menghemat waktu komputasi, Random Forest tidak dijalankan per wilayah, *ablation study* hanya memakai tiga set pada satu pembagian data *holdout*, *perturbation test* memakai 10 hari acak, dan *permutation importance* dihitung pada 4.000 jam.
+
+Prediksi *testing* dan model 21 *feature* tiap wilayah disimpan ke `results/regions_out/` (berkas besar, tidak ikut di repo; dibutuhkan hanya untuk dashboard web). Sel berikut mendefinisikan fungsi *pipeline*; pemanggilannya ada pada Subbab 3.2.6.
+""")
+code("mr_funcs")
+
+# ---------------------------------------------------------------- BAB 3.2
+md("### 3.2 Results\n#### 3.2.1 Eksplorasi Data")
+code("eda")
+md(P("eda1") + "\n\n" + P("eda2"))
+
+md("#### 3.2.2 Hasil Regression")
+code("models")
+md(P("reg1"))
+code("plots")
+md(P("reg2") + "\n\n" + P("reg3"))
+
+md("#### 3.2.3 Ablation Study")
+code("ablation")
+md(P("abl"))
+
+md("#### 3.2.4 Evaluasi Rolling-Origin")
+code("rolling")
+md(P("roll"))
+
+md("#### 3.2.5 Analisis Error dan Feature Importance")
+code("errors")
+md(P("err1") + "\n\n" + P("err2") + "\n\n" + P("err3"))
+code("importance")
+md(P("imp"))
+
+md("#### 3.2.6 Hasil pada Sepuluh Wilayah")
+code("mr_run"); code("mr_compare")
+md(P("mr1") + "\n\n" + P("mr2"))
+
 md("""\
-Sel di atas menjalankan **grid ringkas** di dalam notebook (semua *preprocessing* dengan K-Means, plus GMM-diag, Ward, dan *spectral* pada data standar). Grid penuh (265 konfigurasi) dan pengujian pada 9 wilayah lain dijalankan lewat skrip terpisah `cluster_tune.py`, `cluster_pairs.py`, dan `cluster_regions.py` (hasilnya `cluster_tune_*.json`, dimuat oleh sel berikut) karena memakan waktu lama.
+#### 3.2.7 Hasil Clustering
+*Clustering* merupakan analisis pendukung yang tidak dipakai sebagai masukan model *regression*. Hasilnya disajikan dalam dua tahap. Tahap pertama adalah hasil *tuning preprocessing* dan perbandingan algoritma, yang dimuat dari hasil grid penuh di `cluster_tuning/` (sel pertama di bawah). Tahap kedua adalah hasil konfigurasi yang akhirnya dipilih (sel kedua).
 """)
 code("cluster_full")
 md(f"""\
-#### 4.1.2 Hasil tuning dan pemilihan konfigurasi
-- **Aturan yang dideklarasikan akan memilih** *{top['alg']}* pada *{top['prep']}* (k = {top['k']}, `score` {f3(top['score'])}). Selisihnya terhadap K-Means standar kecil: +{f3(spc['diff_vs_kmeans_std'])} ± {f3(spc['diff_sd'])} (*paired* 70%-*subsample*). Stabilitasnya {f2(top['stab'])} (lebih rendah daripada K-Means, {f2(CT['pjme_awal'][0]['stab'])}), dan *spectral clustering* tidak punya fungsi `predict` untuk hari baru.
-- **Bentuk + level** (K-Means) menghasilkan `score` serupa (+{f3(sh['diff_vs_kmeans_std'])}), dan R² rekonstruksi di PJME hampir sama ({f2(CT['pjme_top10'][1]['recon_R2'])} vs {f2(CT['pjme_awal'][0]['recon_R2'])} pada konfigurasi awal), tetapi rata-rata 10 wilayah jauh lebih rendah ({f2(CT['regions'][2]['recon_R2'])} vs {f2(CT['regions'][0]['recon_R2'])}): *cluster*-nya memisahkan hari menurut bentuk sehingga kurang mewakili profil MW. Skor S2-nya juga cenderung menguntungkan konfigurasi ini karena ruang fiturnya mirip S2.
-- **Keputusan: K-Means pada MW tanpa standardisasi.** Ini **bukan** pemenang `score` tertinggi menurut aturan di atas; ini keputusan pertimbangan yang diambil setelah melihat hasil, dengan alasan: selisih ketiganya kecil, K-Means mentah lebih stabil daripada *spectral* dan bentuk + level ({f2(CT['pjme_top10'][2]['stab'])} vs {f2(top['stab'])} dan {f2(CT['pjme_top10'][1]['stab'])}), mewakili profil MW sebaik K-Means standar atau lebih baik (R² {f2(CT['pjme_top10'][2]['recon_R2'])}), bisa memberi label hari baru, dan paling sederhana. Di 10 wilayah, dibanding standardisasi per jam, MW mentah lebih tinggi pada R² rekonstruksi di **{CT['raw_vs_std']['recon_R2']} dari 10** wilayah dan pada `score` di **{CT['raw_vs_std']['score']} dari 10**; selisih `score` PJME +{f3(kraw['diff_vs_kmeans_std'])} (menang di {kraw['wins']} dari 10 *resample*).
-- **Tidak ada model yang jelas lebih baik.** Pada PJME semua algoritma memilih k = 2, *preprocessing* hampir tidak mengubah hasil K-Means (`score` 0,271–0,276), dan proyeksi PCA tidak menunjukkan celah antar *cluster*. Perubahan dari konfigurasi awal berupa perbaikan kecil yang konsisten, bukan lompatan.
-- **Silhouette bergantung pada ruang fitur.** Angka Silhouette konfigurasi baru ({f3(CL['silhouette'])}) dan awal ({f3(CL['silhouette_std'])}) dihitung di ruangnya masing-masing, jadi selisihnya tidak bisa dibaca sebagai "model baru lebih bagus sebesar itu"; ukuran yang bisa dibandingkan adalah `score` dan R² rekonstruksi di atas. Kedua partisi mirip (ARI {f2(CL['ari_vs_std'])}).
+**Perbandingan algoritma.** {P('cl_alg')}
+
+**Pengaruh *preprocessing*.** {P('cl_prep')}
+
+**Uji perbedaan antar-kandidat.** Perbedaan antarkandidat diuji pada 10 *subsample* 70% (k = 2), dengan selisih *score* terhadap K-Means standar dihitung pada *subsample* yang sama. {P('cl_pair')}
+
+**Konsistensi pada sepuluh wilayah.** {P('cl_reg')}
+
+{P('cl_fig')}
+
+**Konfigurasi yang dipilih.** {P('cl_chosen')}
+
+{P('cl_nobetter')}
 """)
 code("cluster_fit")
-md(f"""\
-**Interpretasi *cluster* (k = {CL['k']}).** *Cluster* *beban tinggi* ({CL['summary'][1]['n_hari']:,} hari, rata-rata {f0(CL['summary'][1]['rata2_MW'])} MW) terkonsentrasi pada Juni–Agustus dan Desember–Februari,
-dengan puncak sore (median jam {CL['summary'][1]['jam_puncak_median']:.0f}). *Cluster* *beban rendah* ({CL['summary'][0]['n_hari']:,} hari, rata-rata {f0(CL['summary'][0]['rata2_MW'])} MW) berisi musim peralihan (Mar–Mei, Sep–Nov) dan lebih banyak akhir pekan
-({CL['summary'][0]['persen_akhir_pekan']*100:.0f}% vs {CL['summary'][1]['persen_akhir_pekan']*100:.0f}%).
+md(P("cl_sil") + "\n\n" + P("cl_c1") + "\n\n" + P("cl_c2"))
+code("mr_cluster_tuning")
+md(P("lampB"))
 
-**Peringatan.** Silhouette {f3(CL['silhouette'])} (k = 2) tertinggi, tetapi proyeksi PCA memperlihatkan **tidak ada celah** antar *cluster*: beban harian membentuk kontinum dan K-Means hanya membelahnya pada tingkat beban sekitar tengah.
-Jadi *cluster* ini berguna sebagai ringkasan ("hari ekstrem musim" vs "hari moderat"), bukan bukti bahwa ada dua jenis hari yang terpisah alami. Silhouette untuk k = 3 adalah {f3(sil[3])}.
-""")
+# ---------------------------------------------------------------- 3.3 Evaluation
+md(f"""\
+### 3.3 Evaluation
+#### 3.3.1 Metrik Evaluasi
+{P('ev61_a')}
 
-md("### 4.2 Regression: peramalan day-ahead\nPertama dibangun fitur dan split, lalu baseline, lalu penalaan HGB.")
-code("features")
-code("leak")
-md("**Uji kebocoran (perturbasi).** Seluruh nilai beban satu hari D dirusak dengan angka acak, lalu semua fitur dihitung ulang. Jika ada fitur pada jam-jam hari D yang ikut berubah, fitur itu memakai informasi dari hari yang diramal. Pengujian pada 25 hari acak: lihat keluaran sel di atas (harus tidak ada fitur yang berubah).")
-code("baseline")
-md("Baseline terbaik adalah **persistensi harian** (beban jam yang sama kemarin). Model harus mengalahkannya agar dianggap punya kemampuan prediksi.")
-code("tune"); code("ablation")
-md(f"""\
-**Ablasi fitur.** Kenaikan akurasi terbesar datang dari informasi, bukan dari algoritma: kalender saja → galat relatif {f1(AB[0]['rel'])}% di test; + lag ≥ 24 jam → {f1(AB[1]['rel'])}%; + fitur saat-terbit → {f1(AB[2]['rel'])}%.
-Urutan yang sama muncul pada CV kronologis di dalam train ({f1(AB[0]['cv_rel_pct'])}% → {f1(AB[1]['cv_rel_pct'])}% → {f1(AB[2]['cv_rel_pct'])}%), yang tidak menyentuh test.
+$$MAE = \\frac{{1}}{{n}} \\sum |y - \\hat{{y}}|$$
+$$RMSE = \\sqrt{{\\frac{{1}}{{n}} \\sum (y - \\hat{{y}})^2}}$$
+$$R^2 = 1 - \\frac{{\\sum (y - \\hat{{y}})^2}}{{\\sum (y - \\bar{{y}})^2}}$$
+$$Relative\\ error = \\frac{{MAE}}{{\\bar{{y}}}} \\times 100\\%$$
 
-**Catatan kejujuran.** Set fitur saat-terbit dirancang setelah uji coba awal yang juga melihat data test, jadi angka test set C sedikit optimistis.
-CV di dalam train dan rolling-origin di bawah memberi konfirmasi yang tidak bergantung pada pilihan itu.
-""")
-md("## 5. Results\n### 5.1 Perbandingan model di test (2015-2018)")
-code("models")
-code("plots")
-md("### 5.2 Ketahanan: rolling-origin 8 lipatan (uji 6 bulan per lipatan, train meluas)")
-code("rolling")
-md("### 5.3 Analisis galat dan fitur penting")
-code("errors"); code("importance")
-md(f"""\
-### 5.4 Perluasan: pipeline yang sama untuk 10 wilayah
-Setiap wilayah memperoleh model sendiri dengan pipeline yang sama (fitur aman kebocoran, baseline, penalaan hanya di train, rolling-origin, clustering, uji kebocoran). Perbedaan dengan analisis utama PJME di atas:
-- **Periode uji bersama** 2016-01-01 s.d. 2018-08-02 untuk semua wilayah (agar adil dan agar wilayah dengan data pendek seperti EKPC, mulai 2013, masih punya train ≥ 2,5 tahun). PJME diulang pada protokol ini **hanya untuk tabel perbandingan**; hasil utama PJME (uji 2015+) tetap yang di atas, sehingga angka PJME di tabel sedikit berbeda.
-- **Set fitur dan rentang hiperparameter tidak disetel ulang per wilayah**: dirancang pada PJME. Untuk wilayah lain ini berarti pemilihan fitur tidak melihat data uji mereka; hanya hiperparameter yang dicari ulang di train (grid 8 kombinasi, `TimeSeriesSplit(4)`).
-- Untuk menghemat waktu, Random Forest tidak dijalankan per wilayah (pembandingnya Ridge + 4 baseline), ablasi hanya 3 set di holdout (tanpa CV), uji kebocoran pada 10 hari acak, importance pada 4.000 jam.
-- Prediksi uji dan model 21 fitur tiap wilayah disimpan ke `results/regions_out/` (berkas besar, tidak ikut di repo; dibutuhkan hanya untuk dashboard web).
-""")
-code("mr_funcs"); code("mr_run"); code("mr_compare"); code("mr_cluster_tuning"); code("mr_save")
-md(f"""\
-**Bacaan.** HGB mengalahkan baseline terbaik (MAE) di **{wins_reg} dari {n_reg}** wilayah, dengan penurunan MAE {f1(tmin)}%–{f1(tmax)}%; pada rolling-origin HGB menang di {roll_all} dari {roll_n} lipatan gabungan seluruh wilayah.
-Galat relatif HGB terendah di **{lo_c}** ({f2(CMP[lo_c]['rel_HGB'])}%) dan tertinggi di **{hi_c}** ({f2(CMP[hi_c]['rel_HGB'])}%). Korelasi log(beban rata-rata) dengan galat relatif r = {f2(corr_)}: galat relatif {corr_txt} (hanya {n_reg} titik, indikatif saja).
-Uji kebocoran: {"tidak ada fitur yang berubah pada seluruh wilayah" if not leak_any else "fitur berubah pada: " + ", ".join(leak_any)}.
-**Batas klaim.** Tiap wilayah diuji pada satu periode uji ≈ 2,6 tahun tanpa data cuaca; angka antarwilayah tidak diuji signifikansinya, dan kesamaan pola antarwilayah yang bertetangga (mis. cuaca yang sama) berarti hasilnya tidak independen.
-""")
+{P('ev61_b')}
 
-md(f"""\
-## 6. Evaluation
-| Ukuran | Baseline terbaik (lag24) | HistGradientBoosting |
-|---|---|---|
+#### 3.3.2 Arti Nilai Evaluasi
+*Ringkasan evaluasi HGB dibanding baseline terbaik pada PJME.*
+
+| Ukuran | *Baseline* terbaik (lag24) | HistGradientBoosting |
+|---|---:|---:|
 | MAE (MW) | {f0(BB['MAE'])} | **{f0(H['MAE'])}** |
 | RMSE (MW) | {f0(BB['RMSE'])} | **{f0(H['RMSE'])}** |
 | R² | {f3(BB['R2'])} | **{f3(H['R2'])}** |
-| Galat relatif (MAE / rata-rata beban test {f0(S['test_mean'])} MW) | {f2(BB['rel'])}% | **{f2(H['rel'])}%** |
+| *Relative error* (rata-rata beban *testing* {f0(S['test_mean'])} MW) | {f2(BB['rel'])}% | **{f2(H['rel'])}%** |
 
-- **Cara membaca R²:** R² {f3(H['R2'])} menggelembung oleh siklus harian yang mudah ditebak: baseline lag24 saja sudah R² {f3(BB['R2'])}. Ukuran yang lebih jujur adalah penurunan galat terhadap baseline dan galat relatif, bukan R² mentah.
-- **Kemampuan prediksi nyata:** HGB menurunkan MAE sebesar **{f1(SK['mae_reduction_pct'])}%** dan RMSE **{f1(SK['rmse_reduction_pct'])}%** dibanding persistensi harian.
-- **Konsisten antarwaktu:** pada rolling-origin, HGB mengalahkan lag24 di **{RO['hgb_wins']} dari {RO['n']}** lipatan; galat relatif rata-rata {f2(RO['rel_hgb_mean'])}% (std {f2(RO['rel_hgb_std'])}) vs {f2(RO['rel_lag24_mean'])}% untuk lag24; R² rata-rata {f3(RO['r2_mean'])}.
-  Lipatan terakhir (2018) paling sulit (galat relatif {f2(RO['rows'][-1]['rel_HGB'])}%), jadi ada indikasi galat naik pada periode terbaru; penyebabnya tidak diselidiki.
-- **Algoritma bukan faktor utama:** Ridge sederhana mencapai R² {f3(RGm['R2'])} (galat relatif {f2(RGm['rel'])}%) dan Random Forest {f3(RFm['R2'])} ({f2(RFm['rel'])}%), selisih kecil dari HGB.
-- **Galat:** bias rata-rata {f0(ER['bias'])} MW (cenderung meramal sedikit rendah), P90 galat absolut {f0(ER['p90'])} MW, P99 {f0(ER['p99'])} MW, maksimum {f0(ER['max'])} MW. Hari kerja {f2(ER['daytype']['Hari kerja'])}%, akhir pekan {f2(ER['daytype']['Akhir pekan'])}%, libur federal {f2(ER['daytype']['Libur federal'])}% (MAPE).
-  Hari terburuk didominasi akhir pekan (8 dari 10 hari terburuk; periksa keluaran sel di atas).
-- **Clustering:** Silhouette {f3(CL['silhouette'])} untuk k = {CL['k']} (K-Means pada MW tanpa standardisasi, hasil tuning); ini merupakan pembelahan kontinum (lihat Bagian 4.1). Tuning {CT['pjme_n_total']} konfigurasi tidak menemukan model yang jelas lebih baik.
+{P('ev62')}
+
+#### 3.3.3 Catatan terhadap Validitas Hasil
+1. {P('ev63_0')}
+2. {P('ev63_1')}
+3. {P('ev63_2')}
+4. {P('ev63_3')}
+5. {P('ev63_4')}
+
+#### 3.3.4 Evaluasi Clustering
+{P('ev64_0')}
+
+{P('ev64_1')}
+
+1. {P('ev64_2')}
+2. {P('ev64_3')}
+3. {P('ev64_4')}
+4. {P('ev64_5')}
 """)
 
+# ---------------------------------------------------------------- 3.4 Engineering Interpretation
 md(f"""\
-## 7. Engineering Interpretation
-1. **Mengapa akurasinya tinggi?** Beban agregat banyak pelanggan meredam perilaku acak tiap rumah, dan data per jam memberi riwayat yang sangat berkorelasi (beban sekarang sangat mirip beban jam sebelumnya).
-   R² ≈ {f2(H['R2'])} dan galat relatif ≈ {f1(H['rel'])}% di sini terutama karena sifat data, bukan karena algoritma yang lebih baik (Ridge dan Random Forest hampir sama baiknya).
-2. **Informasi terbaik adalah kondisi terbaru.** Fitur terpenting adalah beban pukul 23:00 hari sebelumnya dan beban jam yang sama kemarin (lihat permutation importance); hari dalam pekan, jam, dan rata-rata beban harian menyusul, sedangkan bulan relatif kecil. Ini sejalan dengan fakta bahwa beban dipengaruhi cuaca yang persisten dari hari ke hari.
-3. **Keterbatasan fisik: cuaca tidak ada.** Beban sensitif terhadap suhu (pendingin/pemanas), sedangkan data ini tidak memuat prakiraan suhu. Galat terbesar terjadi pada hari yang berbeda dari hari sebelumnya (terutama akhir pekan setelah hari kerja dengan cuaca berbeda).
-   Dugaan ini konsisten dengan temuan, tetapi **tidak diuji** karena tidak ada data cuaca. Menambahkan prakiraan suhu adalah langkah berikutnya yang paling masuk akal.
-4. **Makna galat dalam MW.** MAE sekitar {f1(H['MAE']/1000)} GW; P99 sekitar {f1(ER['p99']/1000)} GW. Galat sebesar ini yang harus diantisipasi operator dengan cadangan; kami tidak menghitung biaya karena tidak ada data tarif atau cadangan.
-5. **Apakah hasil PJME khas?** Pada 9 wilayah lain dengan pipeline yang sama, HGB mengalahkan baseline terbaik di {wins_reg} dari {n_reg} wilayah (galat relatif {f2(CMP[lo_c]['rel_HGB'])}%–{f2(CMP[hi_c]['rel_HGB'])}%), jadi pola "beban agregat per jam sangat dapat diramal dari kalender dan riwayat" tidak hanya berlaku di PJME. Galat relatif {corr_txt}.
-6. **Keterbatasan generalisasi.** Data satu wilayah di Amerika Serikat (iklim, kalender libur, dan perilaku konsumsi berbeda dari Indonesia). Pola yang sama tidak otomatis berlaku di Indonesia (mis. tanpa musim dingin, ada Lebaran); hal itu perlu data lokal.
+### 3.4 Engineering Interpretation
+#### 3.4.1 Interpretasi Hasil dari Perspektif Teknik Elektro
+{P('int0')}
+
+{P('int1')}
+
+{P('int2')}
+
+#### 3.4.2 Manfaat Hasil AI
+1. {P('ben0')}
+2. {P('ben1')}
+3. {P('ben2')}
+
+#### 3.4.3 Penggunaan dalam Sistem Teknik Elektro
+{P('use0')}
+
+#### 3.4.4 Keterbatasan
+1. {P('lim0')}
+2. {P('lim1')}
+3. {P('lim2')}
+4. {P('lim3')}
+5. {P('lim4')}
+6. {P('lim5')}
+
+#### 3.4.5 Pengembangan untuk Kondisi Nyata
+1. {P('dev0')}
+2. {P('dev1')}
+3. {P('dev2')}
+4. {P('dev3')}
+5. {P('dev4')}
 """)
 
+# ---------------------------------------------------------------- BAB 4 + pustaka + lampiran
 md(f"""\
-## 8. Conclusion
-- Dengan fitur kalender + riwayat beban yang aman dari kebocoran, HGB meramal beban per jam sehari ke depan dengan **MAE {f0(H['MAE'])} MW (galat relatif {f2(H['rel'])}%), RMSE {f0(H['RMSE'])} MW, R² {f3(H['R2'])}** di test 2015–2018,
-  **{f1(SK['mae_reduction_pct'])}% lebih baik** daripada persistensi harian, dan konsisten pada {RO['hgb_wins']} dari {RO['n']} lipatan rolling-origin.
-- Angka paling jujur adalah rata-rata rolling-origin: galat relatif {f2(RO['rel_hgb_mean'])}% dan R² {f3(RO['r2_mean'])}; angka test sedikit optimistis karena set fitur saat-terbit dirancang setelah melihat data test.
-- Akurasi yang tinggi berasal dari **jenis data** (agregat, per jam) dan **fitur riwayat**, bukan dari model yang lebih kompleks; Ridge hampir sama baiknya.
-- Clustering memberi ringkasan "hari ekstrem musim vs moderat" (Silhouette {f3(CL['silhouette'])}), tetapi datanya kontinum sehingga *cluster* bukan kelompok alami. Tuning *preprocessing* dan perbandingan 6 algoritma hanya menghasilkan perbaikan kecil; K-Means tanpa standardisasi dipilih sebagai keputusan pertimbangan (bukan pemenang `score` menurut aturan yang dideklarasikan).
-- Perluasan 10 wilayah: HGB mengalahkan baseline terbaik di {wins_reg} dari {n_reg} wilayah (penurunan MAE {f1(tmin)}%–{f1(tmax)}%, galat relatif {f2(CMP[lo_c]['rel_HGB'])}%–{f2(CMP[hi_c]['rel_HGB'])}%) tanpa menyetel ulang fitur per wilayah; pra-proses hanya membuang {len(anom_all)} nilai tak masuk akal.
-- Langkah lanjut: tambahkan prakiraan suhu, uji ramalan probabilistik (interval), dan validasi pada data beban Indonesia bila tersedia.
+## BAB 4. KESIMPULAN
+{P('con0')}
 
-## 9. Daftar Pustaka
-Dataset acuan (rujukan tim; berkas yang dipakai berasal dari salinan GitHub dan paket data yang diunggah, bukan langsung dari PJM):
-- [D1] Kaggle: robikscube, Hourly Energy Consumption, https://www.kaggle.com/datasets/robikscube/hourly-energy-consumption
-- [D2] Kaggle: ashishkumarrana, PJM Hourly Energy Consumption, https://www.kaggle.com/datasets/ashishkumarrana/pjm-hourly-energy-consumption
-- [D3] IEEE DataPort: PJM Hourly Energy Consumption, https://ieee-dataport.org/documents/pjm-hourly-energy-consumption
-- [D4] GitHub: navyasancheti/PJME-Hourly-Energy-Consumption, https://github.com/navyasancheti/PJME-Hourly-Energy-Consumption
-- [D5] GitHub: panambY/Hourly_Energy_Consumption, https://github.com/panambY/Hourly_Energy_Consumption
-- Berkas `PJME_hourly.csv` dibaca dari repositori `panambY/Hourly_Energy_Consumption` [D5]; README-nya menyebut asal data: situs PJM dan Kaggle.
-- Pedregosa dkk., *Scikit-learn: Machine Learning in Python*, JMLR 12, 2011 (K-Means, HistGradientBoosting, Random Forest, Ridge, TimeSeriesSplit).
-- Library Python `holidays` (kalender libur federal AS, `holidays.US`).
+{P('con1')}
 
-## 10. Lampiran
-Seluruh angka pada laporan berasal dari keluaran notebook ini (`results/results.json` untuk PJME, `results/results_regions.json` untuk 10 wilayah). Data wilayah ada di folder `data_pjm/`. Benih acak 42. Waktu eksekusi notebook sekitar 40 menit pada 2 CPU, belum termasuk grid penuh *clustering* di `cluster_tuning/` (sekitar 45 menit per wilayah untuk PJME).
+{P('con2')}
+
+{P('con3')}
+
+## DAFTAR PUSTAKA
+[1] Kementerian ESDM, “Paparkan Capaian 2023, Menteri ESDM Klaim Peningkatan Rasio Elektrifikasi,” 15 Jan. 2024. [Online]. Available: https://www.esdm.go.id/id/berita-unit/direktorat-jenderal-ketenagalistrikan/paparkan-capaian-2023-menteri-esdm-klaim-peningkatan-rasio-elektrifikasi (Diakses pada 6 Oktober 2026).
+
+[2] Kementerian ESDM, “Tertinggal dari Negara Lain, Kementerian ESDM Libatkan Stakeholder dalam Diskusi Peningkatan Konsumsi Listrik Per Kapita,” 25 Nov. 2022. [Online]. Available: https://esdm.go.id/id/berita-unit/direktorat-jenderal-ketenagalistrikan/tertinggal-dari-negara-lain-kementerian-esdm-libatkan-stakeholder-dalam-diskusi-peningkatan-konsumsi-listrik-per-kapita (Diakses pada 6 Oktober 2026).
+
+[3] hukumonline, “Bahlil Resmi Umumkan RUPTL Tahun 2025–2034,” 26 Mei 2025. [Online]. Available: https://www.hukumonline.com/berita/a/bahlil-resmi-umumkan-ruptl-tahun-2025-2034-lt68344d6f0dc8a (Diakses pada 8 Oktober 2026).
+
+[4] Investortrust, “PLN Bersiap Hadapi Lonjakan Permintaan Listrik 511 TWh, dari ‘Data Center’ hingga EV,” 2 Jun. 2025. [Online]. Available: https://investortrust.id/business/68024/pln-bersiap-hadapi-lonjakan-permintaan-listrik-511-twh-dari-data-center-hingga-ev (Diakses pada 8 Oktober 2026).
+
+[5] Kementerian ESDM, “Kunjungi APB Ungaran, Menteri ESDM Pastikan Listrik Jawa Bali Aman Jelang Libur Akhir Tahun,” 13 Des. 2018. [Online]. Available: https://esdm.go.id/id/berita-unit/direktorat-jenderal-ketenagalistrikan/kunjungi-apb-ungaran-menteri-esdm-pastikan-listrik-jawa-bali-aman-jelang-libur-akhir-tahun (Diakses pada 11 Oktober 2026).
+
+[6] Bisnis.com, “ESDM Catat Kelebihan Pasokan Listrik Jawa-Bali Turun jadi 4 GW pada 2023,” 18 Jan. 2024. [Online]. Available: https://ekonomi.bisnis.com/read/20240118/44/1733610/esdm-catat-kelebihan-pasokan-listrik-jawa-bali-turun-jadi-4-gw-pada-2023 (Diakses pada 12 Oktober 2026).
+
+[7] T. Hong, “Crystal ball lessons in predictive analytics,” *EnergyBiz*, pp. 35–37, Spring 2015. [Online]. Available: https://blog.drhongtao.com/2015/04/crystal-ball-lessons-in-predictive-analytics.html (Diakses pada 12 Oktober 2026).
+
+[8] M. F. Ainuri, Sarjiya, and I. Ardiyanto, “Short-term load forecasting with long short-term memory: A case study of Java-Bali system,” in *Proc. 12th Int. Conf. Inf. Technol. Electr. Eng. (ICITEE)*, Yogyakarta, Indonesia, 2020, pp. 257–262, doi: 10.1109/ICITEE49829.2020.9271763.
+
+[9] robikscube, “Hourly Energy Consumption,” Kaggle. [Online]. Available: https://www.kaggle.com/datasets/robikscube/hourly-energy-consumption
+
+[10] ashishkumarrana, “PJM Hourly Energy Consumption,” Kaggle. [Online]. Available: https://www.kaggle.com/datasets/ashishkumarrana/pjm-hourly-energy-consumption
+
+[11] “PJM Hourly Energy Consumption,” IEEE DataPort. [Online]. Available: https://ieee-dataport.org/documents/pjm-hourly-energy-consumption
+
+[12] navyasancheti, “PJME-Hourly-Energy-Consumption,” GitHub repository. [Online]. Available: https://github.com/navyasancheti/PJME-Hourly-Energy-Consumption
+
+[13] panambY, “Hourly_Energy_Consumption,” GitHub repository. [Online]. Available: https://github.com/panambY/Hourly_Energy_Consumption
+
+[14] PJM Interconnection, “PJM prepared to meet summer electricity demand,” *Inside Lines*, 11 Mei 2022. [Online]. Available: https://insidelines.pjm.com/?p=205370 (Diakses pada 12 Oktober 2026).
+
+[15] F. Pedregosa et al., “Scikit-learn: Machine learning in Python,” *J. Mach. Learn. Res.*, vol. 12, pp. 2825–2830, 2011.
+
+[16] Python package *holidays*, modul *holidays.US* (kalender libur nasional Amerika Serikat), versi 0.106.
+
+## LAMPIRAN
+**Lampiran 1. Dashboard website mini-project AI.** Hasil model dapat dicoba pada dashboard website di https://loads-ai.vercel.app.
+
+**Lampiran 2. Tautan repositori GitHub dan folder Google Drive.**
+1. Repositori GitHub: https://github.com/putraparindra/pjmloads-ai-14
+2. Folder Google Drive: https://s.id/gOqlo
+
+**Lampiran 3. Grid *hyperparameter* HGB.**
+
+| Parameter | Nilai yang dicoba (PJME, analisis utama) | Nilai yang dicoba (analisis 10 wilayah) | Terbaik pada PJME (analisis utama) |
+|---|---|---|---|
+| *learning_rate* | 0,03; 0,06 | 0,06 (tetap) | {f2(TU['best']['learning_rate'])} |
+| *max_iter* | 400; 800 | 400; 800 | {TU['best']['max_iter']} |
+| *max_leaf_nodes* | 31; 63 | 31; 63 | {TU['best']['max_leaf_nodes']} |
+| *min_samples_leaf* | 50; 100 | 50; 100 | {TU['best']['min_samples_leaf']} |
+
+{P('lampA')}
+
+**Lampiran 4. Hasil *clustering* pada sepuluh wilayah.** Tabel hasil K-Means MW asli pada setiap wilayah dibandingkan dengan konfigurasi awal ditampilkan oleh sel terakhir pada Subbab 3.2.7.
+
+**Lampiran 5. Berkas pendukung.** {P('lampC') if 'lampC' in RT else ''}Seluruh angka pada laporan ini berasal dari keluaran notebook ini. Hasil PJME tersimpan pada `results/results.json` dan hasil sepuluh wilayah pada `results/results_regions.json`. Hasil *tuning clustering* tersimpan pada `cluster_tuning/cluster_tune_PJME.json`, `cluster_pairs_PJME.json`, dan `cluster_tune_<wilayah>.json`, yang dihasilkan oleh skrip `cluster_tune.py`, `cluster_pairs.py`, dan `cluster_regions.py`. Data tiap wilayah berada pada folder `data_pjm/`. *Random seed* yang dipakai adalah 42, dan waktu eksekusi notebook sekitar 40 menit pada 2 CPU (belum termasuk *tuning clustering* penuh yang dijalankan terpisah, sekitar 45 menit per wilayah untuk PJME).
+
+**Lampiran 6. Menyimpan hasil.** Dua sel berikut menyimpan seluruh angka ke `results/results_regions.json` (sepuluh wilayah) dan `results/results.json` (PJME).
 """)
-md("### Lampiran A. Menyimpan hasil\nSel berikut menyimpan seluruh angka ke `results/results.json`.")
-code("save")
+code("mr_save"); code("save")
 
 import re as _re
 def _reduce_comment(l):
